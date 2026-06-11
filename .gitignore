@@ -1,0 +1,26 @@
+# ─── 敏感信息（绝不提交）───────────────────────────
+.env
+.cnki_cookies.json
+.cnki_session.json
+.browser_profile/
+reference/            # 含早期 JS 脚本，里面硬编码过密钥
+
+# ─── 运行产物 ──────────────────────────────────────
+downloads/
+*.pdf
+*.caj
+*.log
+
+# ─── Python ────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+
+# ─── 编辑器/系统 ───────────────────────────────────
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

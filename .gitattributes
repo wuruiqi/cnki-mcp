@@ -1,0 +1,5 @@
+# 统一文本文件为 LF 换行，避免跨平台 CRLF 噪音
+* text=auto eol=lf
+*.png binary
+*.jpg binary
+*.pdf binary
