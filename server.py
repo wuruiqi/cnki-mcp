@@ -271,11 +271,19 @@ async def cnki_batch(
 #  服务器入口
 # ─────────────────────────────────────────────────────────────
 
-if __name__ == "__main__":
+def main() -> None:
+    """控制台入口（pip 安装后 `cnki-mcp` 命令调用）。"""
     import atexit
 
     def _cleanup():
-        asyncio.get_event_loop().run_until_complete(close_context())
+        try:
+            asyncio.get_event_loop().run_until_complete(close_context())
+        except Exception:
+            pass
 
     atexit.register(_cleanup)
     mcp.run(transport="stdio")
+
+
+if __name__ == "__main__":
+    main()

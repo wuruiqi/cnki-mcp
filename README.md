@@ -33,17 +33,53 @@ An [MCP](https://modelcontextprotocol.io) server that lets an AI assistant searc
 
 ## 🚀 安装
 
+### 方式 A：pip 安装（推荐，提供 `cnki-mcp` 命令）
+
 ```bash
-git clone https://github.com/<your-account>/cnki-mcp.git
+# 从 GitHub 直接安装（或 pip install cnki-mcp 若已上 PyPI）
+pip install git+https://github.com/wuruiqi/cnki-mcp.git
+python -m playwright install chromium   # 若无系统 Chrome
+```
+
+安装后即有 `cnki-mcp` 控制台命令，启动 stdio MCP 服务器。
+
+### 方式 B：克隆源码
+
+```bash
+git clone https://github.com/wuruiqi/cnki-mcp.git
 cd cnki-mcp
 pip install -r requirements.txt
-python -m playwright install chromium   # 若无系统 Chrome
+python -m playwright install chromium
 cp .env.example .env                     # 按需修改配置
 ```
 
 ### 注册到 MCP 客户端
 
-以 Claude Code 的 `.mcp.json` 为例：
+**pip 安装后**（用 `cnki-mcp` 命令，最简洁）：
+
+```json
+{
+  "mcpServers": {
+    "cnki": { "type": "stdio", "command": "cnki-mcp" }
+  }
+}
+```
+
+**uvx 免安装运行**：
+
+```json
+{
+  "mcpServers": {
+    "cnki": {
+      "type": "stdio",
+      "command": "uvx",
+      "args": ["--from", "git+https://github.com/wuruiqi/cnki-mcp.git", "cnki-mcp"]
+    }
+  }
+}
+```
+
+**克隆源码方式**（直接指向 server.py）：
 
 ```json
 {

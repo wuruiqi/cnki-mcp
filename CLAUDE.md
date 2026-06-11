@@ -4,24 +4,22 @@
 将 CNKI（中国知网）检索、PDF 下载、Zotero 导入功能封装为 MCP 工具，供 Claude 等 AI 助手调用。
 
 ## 运行环境
-- Conda 环境：**cnki-mcp**（Python 3.11）
-- Python 路径：`D:\Programs\miniconda3\envs\cnki-mcp\python.exe`
-- 启动命令：`conda run -n cnki-mcp python server.py`
+- Python **3.10+**（开发用 conda 环境 `cnki-mcp`，Python 3.11）
+- 启动命令：`python server.py`（或 pip 安装后 `cnki-mcp`）
 
 ## 项目结构
 ```
 cnki-mcp/
-├── server.py          # MCP 服务器入口（FastMCP）
+├── server.py          # MCP 服务器入口（FastMCP；main() 供 cnki-mcp 命令调用）
+├── pyproject.toml     # 打包配置（pip/uvx 安装，console 入口 cnki-mcp）
 ├── cnki/
 │   ├── __init__.py
 │   ├── browser.py     # 浏览器会话管理（Playwright，Cookie 持久化）
 │   ├── search.py      # CNKI 搜索（表单交互：填 #txt_search 点 .search-btn）
 │   ├── download.py    # PDF/CAJ 下载（点 #pdfDown / #cajDown 触发 download）
-│   └── zotero.py      # Zotero 导入（本地 API + 云 API 兜底）
-├── tests/             # pytest 测试
-├── reference/         # 原始 JS 脚本（参考）
-├── docs/              # 使用文档
-├── .env               # 密钥配置（不提交）
+│   └── zotero.py      # Zotero 导入（本地 connector + 云 API 兜底）
+├── tests/             # 测试 + 诊断脚本（inspect_*/probe_*）
+├── .env               # 密钥/配置（不提交，见 .env.example）
 └── requirements.txt
 ```
 
@@ -60,12 +58,9 @@ cnki-mcp/
 
 ## 注册到 .mcp.json
 ```json
-"cnki": {
-  "type": "stdio",
-  "command": "D:\\Programs\\miniconda3\\envs\\cnki-mcp\\python.exe",
-  "args": ["D:\\automan\\coding\\projects\\cnki-mcp\\server.py"]
-}
+"cnki": { "type": "stdio", "command": "cnki-mcp" }
 ```
+（pip 安装后用 `cnki-mcp` 命令；源码方式则 `"command": "python", "args": ["/abs/path/server.py"]`）
 
 ## 2026 实测要点（CNKI 改版后，调试时优先核对）
 - **检索必须走表单**：旧版 `SKey`/`dbcode` GET 参数已失效（落到空检索页或 404）。
