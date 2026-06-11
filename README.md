@@ -1,5 +1,9 @@
 # cnki-mcp
 
+[![CI](https://github.com/wuruiqi/cnki-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/wuruiqi/cnki-mcp/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/)
+
 > 把中国知网（CNKI）的**文献检索 → PDF 下载 → 导入 Zotero（自动迁移并关联 PDF）**封装成 MCP 工具，供 Claude 等 AI 助手一键调用。
 
 An [MCP](https://modelcontextprotocol.io) server that lets an AI assistant search CNKI (China National Knowledge Infrastructure), download article PDFs, and import them into Zotero with the PDF automatically attached.

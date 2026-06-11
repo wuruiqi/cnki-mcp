@@ -36,3 +36,8 @@ cnki-mcp = "server:main"
 [tool.setuptools]
 py-modules = ["server"]
 packages = ["cnki"]
+
+[tool.pytest.ini_options]
+markers = [
+    "integration: 需要真实 CNKI 登录 / Zotero 桌面端，CI 中跳过",
+]
