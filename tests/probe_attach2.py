@@ -8,7 +8,7 @@ import httpx
 
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
 BASE = "http://127.0.0.1:23119"
-PDF = r"D:\qq\zotero\cnki_pdfs\基于动态高分辨图像的粮仓玉米温度变化监测方法.pdf"
+PDF = os.environ.get("TEST_PDF", "")  # 设为本地任意 PDF 的绝对路径以测试附件上传
 
 c = httpx.Client(timeout=60, trust_env=False)
 CH = {"Content-Type": "application/json", "X-Zotero-Connector-API-Version": "3", "User-Agent": "Mozilla/5.0"}

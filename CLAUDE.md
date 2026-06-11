@@ -4,7 +4,7 @@
 将 CNKI（中国知网）检索、PDF 下载、Zotero 导入功能封装为 MCP 工具，供 Claude 等 AI 助手调用。
 
 ## 运行环境
-- Python **3.10+**（开发用 conda 环境 `cnki-mcp`，Python 3.11）
+- Python **3.10+**（建议使用独立虚拟环境）
 - 启动命令：`python server.py`（或 pip 安装后 `cnki-mcp`）
 
 ## 项目结构
@@ -19,7 +19,7 @@ cnki-mcp/
 │   ├── download.py    # PDF/CAJ 下载（点 #pdfDown / #cajDown 触发 download）
 │   └── zotero.py      # Zotero 导入（本地 connector + 云 API 兜底）
 ├── tests/             # 测试 + 诊断脚本（inspect_*/probe_*）
-├── .env               # 密钥/配置（不提交，见 .env.example）
+├── .env.example       # 配置模板（复制为 .env 后填写；.env 不提交）
 └── requirements.txt
 ```
 
@@ -37,13 +37,13 @@ cnki-mcp/
 ## 重要规范
 - **Playwright 用异步 API**（`playwright.async_api`），与 MCP async 兼容
 - 浏览器默认 `headless=False`，用户可见
-- Cookie 存储于 `.cnki_session.json`（profile 目录下）
-- PDF 默认存储于 `D:/qq/zotero/cnki_pdfs/`
-- Zotero 优先用本地 connector（port 23119，含 PDF 关联），失败则降级云 API（仅元数据）
+- Cookie 存储于 `COOKIE_FILE`（默认项目根目录 `.cnki_cookies.json`）
+- PDF 暂存于 `PDF_DIR`（默认 `./downloads`，可在 .env 覆盖）
+- Zotero 优先用本地 connector（端口 23119，含 PDF 关联），失败则降级云 API（仅元数据）
 
 ## Zotero 本地导入机制（2026 实测，关键）
-- **必须 `httpx(trust_env=False)`**：系统装了 `127.0.0.1:1080` 代理，会拦截 localhost
-  请求返回 502。绕过代理后本地端点全部可用。
+- **访问本地端口用 `httpx(trust_env=False)`**：若系统配置了 HTTP 代理，可能把
+  localhost 请求也代理出去（典型表现：返回 502）。`trust_env=False` 绕过代理直连本地端口。
 - `/api/*` 本地 API **只读**（POST 返回 "Endpoint does not support method"，DELETE 返回 501），
   只能用来查询/验证，**不能写入**。
 - **写入走 connector**：
@@ -52,7 +52,7 @@ cnki-mcp/
      - body = PDF 原始字节，`Content-Type: application/pdf`
      - `X-Metadata` 头 = ASCII JSON（**必须 `json.dumps(ensure_ascii=True)`**，中文转 \\uXXXX，
        否则 HTTP 头非 ASCII 报错），含 `sessionID`(同上) + `parentItemID`(=父条目的 id)
-  - 成功后 PDF 以 `linkMode=imported_url` 导入 Zotero 存储（不占云空间，已禁用 PDF 云同步）。
+  - 成功后 PDF 以 `linkMode=imported_url` 导入 Zotero 存储（是否云同步由 Zotero 设置决定）。
 - 探测脚本：`tests/probe_zotero2.py`(端点)、`tests/probe_connector.py`(写元数据)、
   `tests/probe_attach2.py`(传附件)、`tests/check_recent.py`(验证)。
 
@@ -79,6 +79,6 @@ cnki-mcp/
 - **PDF 自动关联需 Zotero 桌面端运行**（走本地 connector）。Zotero 未开时降级云 API，
   只写元数据、不带 PDF。
 - PDF 关联后 Zotero 存了自己的副本（`imported_url`）。默认会**自动删除**
-  `D:/qq/zotero/cnki_pdfs/` 里的暂存原件（`DELETE_PDF_AFTER_IMPORT=false` 可关闭保留）。
+  `PDF_DIR` 里的暂存原件（`DELETE_PDF_AFTER_IMPORT=false` 可关闭保留）。
   仅在「成功关联」后才删，关联失败或无 PDF 不动文件。
 - 搜索的"学术期刊"类型限定为 best-effort，总库结果可能混入学位论文。

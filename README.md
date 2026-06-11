@@ -119,7 +119,7 @@ cp .env.example .env                     # 按需修改配置
 ## ⚠️ 说明与限制
 
 - **PDF 自动关联需 Zotero 桌面端在运行**（走本地 connector）；未运行则降级为仅写元数据。
-- 若系统装了本地代理（如 `127.0.0.1:1080`），访问 Zotero 本地端口需绕过代理 —— 本项目已用 `httpx(trust_env=False)` 处理。
+- 若系统配置了 HTTP 代理，访问 Zotero 本地端口需绕过代理 —— 本项目已用 `httpx(trust_env=False)` 处理。
 - 仅供个人学习研究用途，请遵守 CNKI 服务条款与所在机构的使用规定。
 
 ## 🛠 开发

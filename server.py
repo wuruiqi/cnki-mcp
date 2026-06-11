@@ -3,9 +3,8 @@ server.py — CNKI MCP 服务器
 
 FastMCP 入口，注册所有 CNKI 工具。
 启动命令：
-  conda run -n cnki-mcp python server.py
-或直接：
-  D:\Programs\miniconda3\envs\cnki-mcp\python.exe server.py
+  python server.py
+（pip 安装后亦可直接用 `cnki-mcp` 命令启动）
 """
 
 import asyncio

@@ -5,11 +5,11 @@ zotero.py — 导入文献到 Zotero（含 PDF 自动迁移与关联）
 1. Zotero 本地 Connector（localhost:23119）：
    - /connector/saveItems   写入条目元数据
    - /connector/saveAttachment  上传本地 PDF 字节并关联为子附件（导入 Zotero 存储）
-   本地 PDF 不走云存储，规避 300MB 云空间限制。
+   附件是否云同步取决于 Zotero 设置，本地存储不额外占用云配额。
 2. Zotero 云 API：本地不可用时降级，仅写元数据（不含 PDF）。
 
 要点：
-- httpx 必须 trust_env=False —— 系统装了 127.0.0.1:1080 代理会拦截 localhost 返回 502。
+- httpx 必须 trust_env=False —— 若系统配置了 HTTP 代理，可能拦截 localhost 请求返回 502。
 - X-Metadata 头必须纯 ASCII（json.dumps 默认 ensure_ascii=True，中文转 \\uXXXX）。
 """
 
