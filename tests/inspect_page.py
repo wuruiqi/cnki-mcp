@@ -8,11 +8,12 @@
 """
 import asyncio
 import io
+import os
 import sys
 from urllib.parse import quote
 
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
-sys.path.insert(0, "D:/automan/coding/projects/cnki-mcp")
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from cnki.browser import get_context, close_context
 

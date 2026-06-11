@@ -1,10 +1,11 @@
 """搜索 → 打开首篇详情页 → dump 下载按钮结构。"""
 import asyncio
 import io
+import os
 import sys
 
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
-sys.path.insert(0, "D:/automan/coding/projects/cnki-mcp")
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from cnki.browser import get_context, close_context
 from cnki.search import search_papers

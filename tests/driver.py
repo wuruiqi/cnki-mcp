@@ -11,12 +11,13 @@
 import asyncio
 import io
 import json
+import os
 import sys
 
 # 强制 UTF-8 输出，避免 Windows 控制台中文乱码
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
 sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8")
-sys.path.insert(0, "D:/automan/coding/projects/cnki-mcp")
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from cnki.browser import check_login_status, get_context, save_cookies, close_context
 from cnki.search import search_papers

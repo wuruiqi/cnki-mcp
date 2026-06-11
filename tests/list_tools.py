@@ -1,8 +1,9 @@
 """列出 FastMCP 服务器已注册的所有工具及其参数定义（等价于 Inspector 的工具列表）。"""
 import asyncio
 import json
+import os
 import sys
-sys.path.insert(0, "D:/automan/coding/projects/cnki-mcp")
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from server import mcp
 

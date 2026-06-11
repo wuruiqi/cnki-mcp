@@ -1,10 +1,11 @@
 """dump 一条结果行的内部 HTML 结构，定位字段选择器。"""
 import asyncio
 import io
+import os
 import sys
 
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
-sys.path.insert(0, "D:/automan/coding/projects/cnki-mcp")
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from cnki.browser import get_context, close_context
 
