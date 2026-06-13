@@ -24,3 +24,7 @@ venv/
 .idea/
 .DS_Store
 Thumbs.db
+
+# ─── 本地 AI 开发资产（内部，不提交）─────────────
+CLAUDE.md
+_local/
