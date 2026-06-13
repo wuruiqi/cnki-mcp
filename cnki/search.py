@@ -38,10 +38,11 @@ _ROW_SELECTORS = [
 
 # 字段选择器（已在 2026 实测确认）
 _FIELD_SELECTORS: Dict[str, List[str]] = {
-    "title":   ["td.name a", "a.fz14", ".name a"],
-    "year":    ["td.date", ".date"],
-    "journal": ["td.source", ".source"],
-    "authors": ["td.author", ".author"],
+    "title":     ["td.name a", "a.fz14", ".name a"],
+    "year":      ["td.date", ".date"],
+    "journal":   ["td.source", ".source"],
+    "authors":   ["td.author", ".author"],
+    "citations": ["td.quote", ".quote", "td.cited", ".cited"],
 }
 
 # 数据库标签页（按 db_code 限定文献类型）
@@ -49,6 +50,22 @@ _DB_TAB_TEXT = {
     "CJFD": "学术期刊",
     "CDFD": "博士",
     "CMFD": "硕士",
+}
+
+# 排序按钮选择器
+_SORT_SELECTORS: Dict[str, List[str]] = {
+    "citations": [
+        "a:has-text('被引量')",
+        "a:has-text('被引')",
+        "li a:has-text('被引')",
+        ".sort-list a:has-text('被引')",
+    ],
+    "time": [
+        "a:has-text('发表时间')",
+        "li a:has-text('发表时间')",
+        ".sort-list a:has-text('时间')",
+        "a:has-text('时间')",
+    ],
 }
 
 
@@ -125,8 +142,22 @@ async def _try_navigate_search(page, query: str, year_start: int, year_end: int,
     return True
 
 
+async def _click_sort(page, sort_by: str) -> bool:
+    """点击排序按钮（'citations' 或 'time'），等待结果重新加载。返回是否成功点击。"""
+    for sel in _SORT_SELECTORS.get(sort_by, []):
+        try:
+            loc = page.locator(sel).first
+            if await loc.count() > 0 and await loc.is_visible(timeout=2000):
+                await loc.click()
+                await page.wait_for_timeout(4000)
+                return True
+        except Exception:
+            pass
+    return False
+
+
 async def _extract_rows(page, max_count: int) -> List[Dict]:
-    """从当前结果页提取论文列表。"""
+    """从当前结果页提取论文列表（含引用量）。"""
 
     async def first_text(row, selectors: List[str]) -> str:
         for sel in selectors:
@@ -165,21 +196,27 @@ async def _extract_rows(page, max_count: int) -> List[Dict]:
                     continue
 
                 href  = (await title_el.get_attribute("href") or "").strip()
-                year    = await first_text(row, _FIELD_SELECTORS["year"])
-                journal = await first_text(row, _FIELD_SELECTORS["journal"])
-                authors = await first_text(row, _FIELD_SELECTORS["authors"])
+                year      = await first_text(row, _FIELD_SELECTORS["year"])
+                journal   = await first_text(row, _FIELD_SELECTORS["journal"])
+                authors   = await first_text(row, _FIELD_SELECTORS["authors"])
+                cite_text = await first_text(row, _FIELD_SELECTORS["citations"])
 
                 # 年份：只保留 4 位数字
                 m = re.search(r"\d{4}", year)
                 year = m.group() if m else ""
 
+                # 引用量：提取数字
+                cm = re.search(r"\d+", cite_text)
+                citations = int(cm.group()) if cm else 0
+
                 papers.append({
-                    "title":   title,
-                    "href":    href,
-                    "year":    year,
-                    "journal": journal,
-                    "authors": authors,
-                    "url":     href if href.startswith("http") else f"https://kns.cnki.net{href}",
+                    "title":     title,
+                    "href":      href,
+                    "year":      year,
+                    "journal":   journal,
+                    "authors":   authors,
+                    "citations": citations,
+                    "url":       href if href.startswith("http") else f"https://kns.cnki.net{href}",
                 })
             except Exception:
                 pass
@@ -190,6 +227,32 @@ async def _extract_rows(page, max_count: int) -> List[Dict]:
     return papers
 
 
+def _filter_by_year(papers: List[Dict], year_start: int, year_end: int, max_n: int) -> List[Dict]:
+    """过滤年份范围，最多返回 max_n 篇；若过滤后为空则退回不过滤的前 max_n 篇。"""
+    filtered = []
+    for p in papers:
+        y = p.get("year", "")
+        if y.isdigit() and not (year_start <= int(y) <= year_end):
+            continue
+        filtered.append(p)
+        if len(filtered) >= max_n:
+            break
+    return filtered if filtered else papers[:max_n]
+
+
+def _dedup_by_title(lists: List[List[Dict]]) -> List[Dict]:
+    """将多个论文列表合并去重（按标题归一化后判断）。"""
+    seen = set()
+    result = []
+    for papers in lists:
+        for p in papers:
+            key = re.sub(r"\s+", "", p.get("title", "")).lower()
+            if key and key not in seen:
+                seen.add(key)
+                result.append(p)
+    return result
+
+
 async def search_papers(
     query: str,
     year_start: int = 2018,
@@ -198,7 +261,7 @@ async def search_papers(
     db_code: str = "CJFD",
 ) -> Dict:
     """
-    搜索 CNKI 期刊论文。
+    搜索 CNKI 期刊论文（按相关度）。
 
     Args:
         query:       检索词（主题检索，支持空格分隔多词）
@@ -212,8 +275,8 @@ async def search_papers(
           "success": bool,
           "query": str,
           "count": int,
-          "papers": [{"title", "authors", "year", "journal", "url", "href"}, ...]
-          "message": str   # 错误或提示信息
+          "papers": [{"title", "authors", "year", "journal", "citations", "url", "href"}, ...]
+          "message": str
         }
     """
     ctx = await get_context()
@@ -235,20 +298,9 @@ async def search_papers(
                 ),
             }
 
-        # 多取一些再按年份过滤（表单检索不带年份范围）
+        # 多取一些再按年份过滤
         raw = await _extract_rows(page, max_results * 4)
-
-        filtered = []
-        for p in raw:
-            y = p.get("year", "")
-            if y.isdigit() and not (year_start <= int(y) <= year_end):
-                continue
-            filtered.append(p)
-            if len(filtered) >= max_results:
-                break
-
-        # 若年份过滤后为空，退回不过滤的前 max_results 篇
-        papers = filtered if filtered else raw[:max_results]
+        papers = _filter_by_year(raw, year_start, year_end, max_results)
 
         return {
             "success": True,
@@ -256,6 +308,116 @@ async def search_papers(
             "count": len(papers),
             "papers": papers,
             "message": f"找到 {len(papers)} 篇（原始 {len(raw)} 篇，年份 {year_start}-{year_end}），URL: {page.url[:80]}",
+        }
+    finally:
+        await page.close()
+
+
+async def search_multi_sort(
+    query: str,
+    year_start: int = 2018,
+    year_end: int = 2026,
+    top_n_by_time: int = 50,
+    top_n_by_citations: int = 50,
+    db_code: str = "CJFD",
+) -> Dict:
+    """
+    搜索 CNKI 论文，分别按发表时间和引用量排序取前 N 篇，合并去重后返回。
+
+    Args:
+        query:              检索词
+        year_start:         起始年份
+        year_end:           结束年份
+        top_n_by_time:      按发表时间取前 N 篇（0 = 禁用此排序）
+        top_n_by_citations: 按引用量取前 N 篇（0 = 禁用此排序）
+        db_code:            数据库代码
+
+    Returns:
+        {
+          "success": bool,
+          "papers": [...],            # 合并去重后列表
+          "by_time_count": int,
+          "by_citations_count": int,
+          "total_after_dedup": int,
+          "sort_used": {"time": bool, "citations": bool},  # 是否成功使用 CNKI 排序
+          "message": str,
+        }
+    """
+    ctx = await get_context()
+    page = await ctx.new_page()
+    try:
+        reached = await _try_navigate_search(page, query, year_start, year_end, db_code)
+        if not reached:
+            return {
+                "success": False,
+                "papers": [],
+                "by_time_count": 0,
+                "by_citations_count": 0,
+                "total_after_dedup": 0,
+                "sort_used": {"time": False, "citations": False},
+                "message": (
+                    "未能到达搜索结果页。可能原因：\n"
+                    "1. 未登录 CNKI —— 请先调用 cnki_open_login_page 完成登录\n"
+                    "2. 网络不通 —— 请确认校园网 VPN 已连接\n"
+                    "3. CNKI URL 格式已变更"
+                ),
+            }
+
+        by_citations: List[Dict] = []
+        by_time:      List[Dict] = []
+        sort_used = {"time": False, "citations": False}
+
+        # ── 按引用量排序 ──────────────────────────────────────────
+        if top_n_by_citations > 0:
+            clicked = await _click_sort(page, "citations")
+            sort_used["citations"] = clicked
+            raw = await _extract_rows(page, top_n_by_citations * 3)
+            filtered = _filter_by_year(raw, year_start, year_end, top_n_by_citations)
+            if not clicked:
+                # 客户端兜底排序：按 citations 字段降序
+                filtered = sorted(filtered, key=lambda p: p.get("citations", 0), reverse=True)
+            by_citations = filtered[:top_n_by_citations]
+
+        # ── 按发表时间排序 ────────────────────────────────────────
+        if top_n_by_time > 0:
+            clicked = await _click_sort(page, "time")
+            sort_used["time"] = clicked
+            raw = await _extract_rows(page, top_n_by_time * 3)
+            filtered = _filter_by_year(raw, year_start, year_end, top_n_by_time)
+            if not clicked:
+                # 客户端兜底排序：按年份降序
+                filtered = sorted(
+                    filtered,
+                    key=lambda p: int(p.get("year") or "0"),
+                    reverse=True,
+                )
+            by_time = filtered[:top_n_by_time]
+
+        # ── 两项均未请求时，按相关度取前 50 ──────────────────────
+        if top_n_by_citations == 0 and top_n_by_time == 0:
+            raw = await _extract_rows(page, 150)
+            by_time = _filter_by_year(raw, year_start, year_end, 50)
+
+        # ── 合并去重 ──────────────────────────────────────────────
+        papers = _dedup_by_title([by_citations, by_time])
+
+        parts = []
+        if top_n_by_citations > 0:
+            parts.append(f"引用量前{len(by_citations)}篇")
+        if top_n_by_time > 0:
+            parts.append(f"时间前{len(by_time)}篇")
+
+        return {
+            "success": True,
+            "papers": papers,
+            "by_time_count": len(by_time),
+            "by_citations_count": len(by_citations),
+            "total_after_dedup": len(papers),
+            "sort_used": sort_used,
+            "message": (
+                f"搜索成功：{'、'.join(parts) if parts else '相关度前50篇'}，"
+                f"合并去重后共 {len(papers)} 篇"
+            ),
         }
     finally:
         await page.close()

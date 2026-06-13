@@ -15,10 +15,11 @@ zotero.py — 导入文献到 Zotero（含 PDF 自动迁移与关联）
 
 import os
 import json
+import re
 import uuid
 import asyncio
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set
 
 import httpx
 from dotenv import load_dotenv
@@ -58,6 +59,11 @@ def _build_item(paper: Dict) -> Dict:
             if name:
                 creators.append({"creatorType": "author", "firstName": "", "lastName": name})
 
+    # 合并默认 tag 与 paper 自带 tag
+    default_tags = [{"tag": "CNKI"}, {"tag": "cnki-mcp"}]
+    extra_tags = paper.get("tags", [])
+    merged_tags = {t["tag"]: t for t in (default_tags + extra_tags)}.values()
+
     item: Dict = {
         "itemType": "journalArticle",
         "title": paper.get("title", "").strip(),
@@ -66,7 +72,7 @@ def _build_item(paper: Dict) -> Dict:
         "date": paper.get("year", "").strip(),
         "language": "zh-CN",
         "url": paper.get("url", "").strip(),
-        "tags": [{"tag": "CNKI"}, {"tag": "cnki-mcp"}],
+        "tags": list(merged_tags),
     }
     if paper.get("abstract"):
         item["abstractNote"] = paper["abstract"].strip()
@@ -77,6 +83,9 @@ def _build_item(paper: Dict) -> Dict:
             kw = kw.strip()
             if kw:
                 item["tags"].append({"tag": kw})
+    # 收藏夹：_collection_key 是内部字段，不是论文元数据
+    if paper.get("_collection_key"):
+        item["collections"] = [paper["_collection_key"]]
     return item
 
 
@@ -212,7 +221,6 @@ async def _import_via_cloud_api(papers: List[Dict]) -> Dict:
     url = f"{ZOTERO_CLOUD_BASE}/users/{ZOTERO_LIB_ID}/items"
     body = json.dumps(items, ensure_ascii=False).encode("utf-8")
     # 云端用默认 trust_env=True，保留系统代理（外网可能需经代理访问 api.zotero.org）。
-    # 本地 connector 才需 trust_env=False 绕过代理（见 _import_via_connector）。
     async with httpx.AsyncClient(timeout=30) as client:
         r = await client.post(url, headers=_CLOUD_HEADERS, content=body)
 
@@ -250,3 +258,188 @@ async def import_papers(papers: List[Dict]) -> Dict:
     cloud = await _import_via_cloud_api(papers)
     cloud["detail"] = f"本地connector不可用({local_err})，降级云API：{cloud['detail']}"
     return cloud
+
+
+# ─── Zotero 查重 ─────────────────────────────────────────────
+
+async def get_existing_titles() -> Set[str]:
+    """
+    从 Zotero 获取已有期刊文章的标题集合（归一化），用于导入前去重。
+
+    优先本地 API，失败时降级云 API。若两者均不可用返回空集合（不阻断导入流程）。
+    标题归一化方式：去掉空白字符后转小写。
+    """
+    titles: Set[str] = set()
+
+    def _normalize(t: str) -> str:
+        return re.sub(r"\s+", "", t).lower()
+
+    def _collect(items: list) -> None:
+        for item in items:
+            t = item.get("data", {}).get("title", "")
+            if t:
+                titles.add(_normalize(t))
+
+    # 本地 API（只读，无需认证）
+    if ZOTERO_LIB_ID:
+        try:
+            async with httpx.AsyncClient(timeout=30, trust_env=False) as client:
+                r = await client.get(
+                    f"{ZOTERO_LOCAL_API}/api/users/{ZOTERO_LIB_ID}/items",
+                    headers={"Zotero-API-Version": "3"},
+                    params={"itemType": "journalArticle", "limit": 500},
+                )
+                if r.status_code == 200:
+                    _collect(r.json())
+                    return titles
+        except Exception:
+            pass
+
+    # 云 API 降级
+    if ZOTERO_API_KEY and ZOTERO_LIB_ID:
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                r = await client.get(
+                    f"{ZOTERO_CLOUD_BASE}/users/{ZOTERO_LIB_ID}/items",
+                    headers=_CLOUD_HEADERS,
+                    params={"itemType": "journalArticle", "limit": 500},
+                )
+                if r.status_code == 200:
+                    _collect(r.json())
+        except Exception:
+            pass
+
+    return titles
+
+
+def filter_new_papers(papers: List[Dict], existing_titles: Set[str]) -> Dict:
+    """
+    从 papers 中过滤掉已在 Zotero 库中的文献。
+
+    Returns:
+        {"new": List[Dict], "skipped": List[str], "removed": int}
+    """
+    def _norm(t: str) -> str:
+        return re.sub(r"\s+", "", t).lower()
+
+    new_papers: List[Dict] = []
+    skipped: List[str] = []
+
+    for p in papers:
+        key = _norm(p.get("title", ""))
+        if key and key in existing_titles:
+            skipped.append(p.get("title", ""))
+        else:
+            new_papers.append(p)
+
+    return {
+        "new": new_papers,
+        "skipped": skipped,
+        "removed": len(skipped),
+    }
+
+
+# ─── Zotero 元数据更新 ───────────────────────────────────────
+
+async def find_zotero_item_by_title(title: str) -> Optional[Dict]:
+    """
+    通过标题在 Zotero 云 API 中搜索条目，返回第一个匹配结果（含 key 和 version）。
+    依赖 ZOTERO_API_KEY 和 ZOTERO_LIB_ID。
+    """
+    if not ZOTERO_API_KEY or not ZOTERO_LIB_ID:
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            r = await client.get(
+                f"{ZOTERO_CLOUD_BASE}/users/{ZOTERO_LIB_ID}/items",
+                headers=_CLOUD_HEADERS,
+                params={"q": title, "itemType": "journalArticle", "limit": 5},
+            )
+            if r.status_code == 200:
+                items = r.json()
+                if items:
+                    return items[0]
+    except Exception:
+        pass
+    return None
+
+
+async def create_zotero_collection(name: str, parent_key: Optional[str] = None) -> Optional[str]:
+    """
+    在 Zotero 库中创建收藏夹，返回新收藏夹 key。
+    依赖云 API（需 ZOTERO_API_KEY + ZOTERO_LIB_ID）。
+    若同名收藏夹已存在则返回其 key；凭据缺失返回 None。
+    """
+    if not ZOTERO_API_KEY or not ZOTERO_LIB_ID:
+        return None
+
+    payload: Dict = {"name": name, "parentCollection": parent_key or False}
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            r = await client.post(
+                f"{ZOTERO_CLOUD_BASE}/users/{ZOTERO_LIB_ID}/collections",
+                headers=_CLOUD_HEADERS,
+                content=json.dumps([payload]).encode("utf-8"),
+            )
+        if r.status_code in (200, 201):
+            keys = list(r.json().get("success", {}).values())
+            return keys[0] if keys else None
+        if r.status_code == 409:
+            return await _find_collection_key(name)
+    except Exception:
+        pass
+    return None
+
+
+async def _find_collection_key(name: str) -> Optional[str]:
+    """在 Zotero 收藏夹列表中查找同名收藏夹，返回其 key。"""
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            r = await client.get(
+                f"{ZOTERO_CLOUD_BASE}/users/{ZOTERO_LIB_ID}/collections",
+                headers=_CLOUD_HEADERS,
+                params={"limit": 100},
+            )
+        if r.status_code == 200:
+            for col in r.json():
+                if col.get("data", {}).get("name") == name:
+                    return col.get("key")
+    except Exception:
+        pass
+    return None
+
+
+async def update_zotero_item(item_key: str, version: int, fields: Dict) -> Dict:
+    """
+    通过 Zotero 云 API PATCH 更新已有条目的元数据字段。
+
+    Args:
+        item_key: Zotero 条目 key（8 位字母数字）
+        version:  条目当前版本号（乐观锁，防并发冲突）
+        fields:   要更新的字段字典，如 {"title": ..., "DOI": ..., "creators": [...]}
+
+    Returns:
+        {"success": bool, "detail": str}
+    """
+    if not ZOTERO_API_KEY or not ZOTERO_LIB_ID:
+        return {"success": False, "detail": "缺少 ZOTERO_API_KEY 或 ZOTERO_LIB_ID，无法更新"}
+
+    url = f"{ZOTERO_CLOUD_BASE}/users/{ZOTERO_LIB_ID}/items/{item_key}"
+    headers = {
+        **_CLOUD_HEADERS,
+        "If-Unmodified-Since-Version": str(version),
+    }
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            r = await client.patch(
+                url,
+                headers=headers,
+                content=json.dumps(fields, ensure_ascii=False).encode("utf-8"),
+            )
+        if r.status_code == 204:
+            return {"success": True, "detail": f"条目 {item_key} 已更新"}
+        if r.status_code == 412:
+            return {"success": False, "detail": f"版本冲突（条目已被修改），请重新获取版本号后重试"}
+        return {"success": False, "detail": f"HTTP {r.status_code}: {r.text[:200]}"}
+    except Exception as e:
+        return {"success": False, "detail": f"请求失败: {e}"}
