@@ -6,10 +6,16 @@
 （需真实 CNKI/Zotero 的集成测试不在此文件，CI 仅跑本文件。）
 """
 
+import asyncio
+import os
+import subprocess
+from pathlib import Path
+
 from cnki.download import _safe_filename
 from cnki.zotero import _build_item, filter_new_papers
 from cnki.pdf_meta import compare_metadata, extract_pdf_metadata
 from cnki import search as search_mod
+from cnki import browser as browser_mod
 
 
 # ─── download._safe_filename ────────────────────────────────
@@ -154,3 +160,135 @@ def test_filter_by_year_fallback_when_all_filtered():
     # 全部超出范围时退回原始前 N 篇
     result = search_mod._filter_by_year(papers, 2020, 2025, 5)
     assert result == papers
+
+
+# ─── browser profile 认领与死实例清理 ────────────────────────
+
+def test_pid_alive_self():
+    assert browser_mod._pid_alive(os.getpid())
+
+
+def test_pid_alive_dead_process():
+    p = subprocess.Popen(["true"])
+    p.wait()
+    assert not browser_mod._pid_alive(p.pid)
+
+
+def test_cleanup_dead_instances(tmp_path):
+    # 死进程的 profile 目录应被清理；活进程与非数字目录保留
+    p = subprocess.Popen(["true"])
+    p.wait()
+    dead = tmp_path / str(p.pid)
+    dead.mkdir()
+    alive = tmp_path / str(os.getpid())
+    alive.mkdir()
+    named = tmp_path / "notanumber"
+    named.mkdir()
+
+    browser_mod._cleanup_dead_instances(tmp_path)
+
+    assert not dead.exists()
+    assert alive.exists()
+    assert named.exists()
+
+
+def test_instance_profile_is_pid_scoped(tmp_path):
+    profile = browser_mod._instance_profile(tmp_path / "base")
+    assert profile.name == str(os.getpid())
+    assert profile.is_dir()
+
+
+def test_claim_profile_reuses_after_release(tmp_path, monkeypatch):
+    # 认领 → 释放 → 再认领：应始终拿回共享 base profile
+    if browser_mod.fcntl is None:
+        return  # 非 POSIX 无 fcntl，跳过
+    base = tmp_path / "prof"
+    monkeypatch.setattr(browser_mod, "PROFILE_DIR", str(base))
+    browser_mod._release_profile_lock()
+    try:
+        assert browser_mod._claim_profile() == base
+        browser_mod._release_profile_lock()
+        assert browser_mod._claim_profile() == base
+    finally:
+        browser_mod._release_profile_lock()
+
+
+def test_claim_profile_conflict_falls_back_to_instance(tmp_path, monkeypatch):
+    # 另一"进程"（另一 fd）持有 base 锁时，必须让路到独立实例目录
+    if browser_mod.fcntl is None:
+        return  # 非 POSIX 无 fcntl，跳过
+    import fcntl as _fcntl
+
+    base = tmp_path / "prof"
+    base.mkdir()
+    monkeypatch.setattr(browser_mod, "PROFILE_DIR", str(base))
+    browser_mod._release_profile_lock()
+
+    lock_path = Path(str(base) + ".lock")
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
+    _fcntl.flock(fd, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+    try:
+        got = browser_mod._claim_profile()
+        assert got != base
+        assert got.name == str(os.getpid())
+        assert str(got).endswith(".instances/" + str(os.getpid()))
+    finally:
+        _fcntl.flock(fd, _fcntl.LOCK_UN)
+        os.close(fd)
+        browser_mod._release_profile_lock()
+
+
+# ─── get_context 崩溃自愈（IPC 探活） ─────────────────────────
+
+async def _async_return(value):
+    return value
+
+
+class _FakeCtx:
+    """模拟 BrowserContext：alive=False 时 cookies() 抛出（Chrome 已崩溃）。"""
+
+    def __init__(self, alive: bool):
+        self.alive = alive
+        self.closed = False
+
+    async def cookies(self):
+        if not self.alive:
+            raise RuntimeError("Target page, context or browser has been closed")
+        return []
+
+    async def close(self):
+        self.closed = True
+
+    def on(self, *_args, **_kwargs):
+        pass
+
+
+def test_get_context_rebuilds_after_browser_crash(tmp_path, monkeypatch):
+    # 死 context：cookies() 探活失败 → 必须丢弃并重建，而不是继续返回
+    dead = _FakeCtx(alive=False)
+    fresh = _FakeCtx(alive=True)
+    monkeypatch.setattr(browser_mod, "_context", dead)
+    monkeypatch.setattr(browser_mod, "_playwright", object())  # 跳过真实启动
+    monkeypatch.setattr(browser_mod, "_claim_profile", lambda: tmp_path)
+    monkeypatch.setattr(browser_mod, "_launch_persistent",
+                        lambda _p: _async_return(fresh))
+    monkeypatch.setattr(browser_mod, "load_cookies", lambda _c: _async_return(None))
+
+    got = asyncio.run(browser_mod.get_context())
+    assert got is fresh
+    assert dead.closed          # 死 context 已被关闭清理
+
+
+def test_get_context_reuses_live_context(tmp_path, monkeypatch):
+    # 活 context：探活成功 → 直接复用，不重启
+    live = _FakeCtx(alive=True)
+
+    def _fail_launch(_p):
+        raise AssertionError("活 context 不应触发重启")
+
+    monkeypatch.setattr(browser_mod, "_context", live)
+    monkeypatch.setattr(browser_mod, "_launch_persistent", _fail_launch)
+
+    got = asyncio.run(browser_mod.get_context())
+    assert got is live
+    assert not live.closed

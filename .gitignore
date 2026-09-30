@@ -3,6 +3,8 @@
 .cnki_cookies.json
 .cnki_session.json
 .browser_profile/
+.browser_profile.instances/
+.browser_profile.lock
 reference/            # 含早期 JS 脚本，里面硬编码过密钥
 
 # ─── 运行产物 ──────────────────────────────────────
@@ -18,6 +20,7 @@ __pycache__/
 .pytest_cache/
 .venv/
 venv/
+.mypy_cache/
 
 # ─── 编辑器/系统 ───────────────────────────────────
 .vscode/

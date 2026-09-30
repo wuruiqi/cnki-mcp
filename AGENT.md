@@ -7,9 +7,11 @@ Compatible with Claude Code, Codex, OpenClaw, Cursor, and any stdio MCP client.
 
 ```
 cnki-mcp/
-├── server.py          # FastMCP entry point; all @mcp.tool() definitions (9 tools)
+├── server.py          # MCPServer entry point; all @mcp.tool() definitions (9 tools)
 ├── cnki/
-│   ├── browser.py     # Browser session management (Playwright async, cookie persistence)
+│   ├── browser.py     # Browser session management (Playwright async, cookie persistence,
+│   │                  #   cross-process profile isolation via flock + per-pid fallback,
+│   │                  #   orphan Chrome cleanup & launch retry)
 │   ├── search.py      # CNKI search: form interaction, multi-sort, dedup utilities
 │   ├── download.py    # PDF/CAJ download (click #pdfDown / #cajDown → download event)
 │   ├── zotero.py      # Zotero import (local connector port 23119 + cloud API fallback)
@@ -91,7 +93,7 @@ Set `DELETE_PDF_AFTER_IMPORT=false` when you want to run `cnki_preview_metadata_
 
 ## Dependencies
 
-`mcp[cli]>=1.27.0`, `playwright>=1.44.0`, `httpx>=0.27.0`, `pydantic>=2.0.0`, `python-dotenv>=1.0.0`, `pymupdf>=1.24.0`
+`mcp[cli]>=2.0.0`, `playwright>=1.44.0`, `httpx>=0.27.0`, `pydantic>=2.0.0`, `python-dotenv>=1.0.0`, `pymupdf>=1.24.0`
 
 Python **3.10+** required.
 

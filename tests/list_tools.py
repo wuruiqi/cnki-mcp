@@ -1,4 +1,4 @@
-"""列出 FastMCP 服务器已注册的所有工具及其参数定义（等价于 Inspector 的工具列表）。"""
+"""列出 MCPServer 服务器已注册的所有工具及其参数定义（等价于 Inspector 的工具列表）。"""
 import asyncio
 import json
 import os
@@ -18,8 +18,8 @@ async def main():
         desc = (t.description or "").strip().splitlines()
         if desc:
             print("  说明: {}".format(desc[0]))
-        props = (t.inputSchema or {}).get("properties", {})
-        required = set((t.inputSchema or {}).get("required", []))
+        props = (getattr(t, "input_schema", None) or getattr(t, "inputSchema", {})).get("properties", {})
+        required = set((getattr(t, "input_schema", None) or getattr(t, "inputSchema", {})).get("required", []))
         for pname, pinfo in props.items():
             mark = "*" if pname in required else " "
             ptype = pinfo.get("type", "?")

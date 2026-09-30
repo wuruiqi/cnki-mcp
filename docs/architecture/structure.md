@@ -2,7 +2,7 @@
 
 ```
 cnki-mcp/
-├── server.py          # FastMCP entry point; all 9 @mcp.tool() definitions
+├── server.py          # MCPServer entry point; all 9 @mcp.tool() definitions
 ├── cnki/
 │   ��── __init__.py
 │   ├── browser.py     # Browser session (Playwright async, cookie persistence)

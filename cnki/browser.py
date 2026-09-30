@@ -3,13 +3,17 @@ browser.py — 浏览器会话管理
 
 负责：
 - 启动/复用一个持久化 Playwright 浏览器上下文
-- Cookie 保存与恢复（CNKI 登录状态持久化）
+- 跨进程 profile 隔离（flock + 按进程独立 profile，防止多实例互抢导致 Chrome 崩溃）
+- 孤儿 Chrome 回收（启动失败时清理残留进程与 Singleton 锁后重试）
+- Cookie 保存与恢复（CNKI 登录状态持久化，原子写入）
 - CNKI 登录状态检测
 """
 
 import asyncio
 import json
 import os
+import shutil
+import subprocess
 from pathlib import Path
 from typing import Optional
 
@@ -19,6 +23,11 @@ from playwright.async_api import (
     Playwright,
 )
 from dotenv import load_dotenv
+
+try:
+    import fcntl
+except ImportError:  # Windows 无 fcntl，始终使用独立 profile
+    fcntl = None  # type: ignore[assignment]
 
 _ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(_ROOT / ".env")
@@ -32,6 +41,288 @@ _playwright: Optional[Playwright]      = None
 _context:    Optional[BrowserContext]  = None
 _lock = asyncio.Lock()
 
+# 跨进程 profile 认领状态（仅在持有 _lock 时读写）
+_profile_lock_fd: Optional[int] = None   # flock 文件描述符；None = 未持有
+_active_profile:  Optional[Path] = None  # 当前实例实际使用的 profile 目录
+
+
+# ─── profile 认领（跨进程互斥） ──────────────────────────────
+
+def _pid_alive(pid: int) -> bool:
+    """判断进程是否存活（含权限不足但仍存在的情况）。"""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _cleanup_dead_instances(instances_dir: Path) -> None:
+    """清理实例目录中属于已死进程的 profile（pid 作为目录名）。"""
+    try:
+        children = list(instances_dir.iterdir())
+    except OSError:
+        return
+    for child in children:
+        if not child.name.isdigit():
+            continue
+        pid = int(child.name)
+        if pid == os.getpid() or _pid_alive(pid):
+            continue
+        shutil.rmtree(child, ignore_errors=True)
+
+
+def _chrome_using_profile(profile: Path) -> bool:
+    """检测是否有存活的 Chrome 进程正在使用该 profile。"""
+    # 不带前导 "--"：pgrep 把 pattern 当操作数，同时仍能精确子串匹配
+    pattern = f"user-data-dir={profile}"
+    try:
+        proc = subprocess.run(
+            ["pgrep", "-f", pattern],
+            capture_output=True, text=True, timeout=10,
+        )
+    except Exception:
+        return False
+    if proc.returncode != 0:
+        return False
+    for line in proc.stdout.splitlines():
+        line = line.strip()
+        if not line.isdigit() or int(line) == os.getpid():
+            continue
+        # pgrep 是正则匹配，再用 ps 精确核对参数，避免误杀
+        try:
+            out = subprocess.run(
+                ["ps", "-p", line, "-o", "command="],
+                capture_output=True, text=True, timeout=5,
+            ).stdout
+        except Exception:
+            continue
+        if f"--user-data-dir={profile}" in out:
+            return True
+    return False
+
+
+async def _kill_orphan_chrome(profile: Path) -> int:
+    """
+    结束使用该 profile 的残留（孤儿）Chrome 进程。
+
+    仅匹配 --user-data-dir 精确等于该自动化 profile 的进程，
+    不影响用户日常使用的 Chrome。返回结束的进程数。
+    """
+    pattern = f"user-data-dir={profile}"
+    try:
+        proc = subprocess.run(
+            ["pgrep", "-f", pattern],
+            capture_output=True, text=True, timeout=10,
+        )
+    except Exception:
+        return 0
+    if proc.returncode != 0:
+        return 0
+
+    killed = 0
+    for line in proc.stdout.splitlines():
+        line = line.strip()
+        if not line.isdigit() or int(line) == os.getpid():
+            continue
+        try:
+            out = subprocess.run(
+                ["ps", "-p", line, "-o", "command="],
+                capture_output=True, text=True, timeout=5,
+            ).stdout
+        except Exception:
+            continue
+        if f"--user-data-dir={profile}" not in out:
+            continue
+        try:
+            os.kill(int(line), 15)  # SIGTERM，让 Chrome 优雅退出
+            killed += 1
+        except OSError:
+            pass
+
+    if killed:
+        for _ in range(20):
+            if not _chrome_using_profile(profile):
+                break
+            await asyncio.sleep(0.25)
+        # 仍未退出的强制结束
+        if _chrome_using_profile(profile):
+            for line in proc.stdout.splitlines():
+                line = line.strip()
+                if line.isdigit() and int(line) != os.getpid():
+                    try:
+                        os.kill(int(line), 9)  # SIGKILL
+                    except OSError:
+                        pass
+    return killed
+
+
+def _remove_singleton_files(profile: Path) -> None:
+    """移除陈旧的 Singleton 锁文件（须在确认无存活 Chrome 后调用）。"""
+    for name in ("SingletonLock", "SingletonSocket", "SingletonCookie"):
+        p = profile / name
+        try:
+            p.unlink()
+        except OSError:
+            pass
+
+
+def _instance_profile(base: Path) -> Path:
+    """返回本进程独立的 profile 目录：<base>.instances/<pid>，并清理死进程遗留。"""
+    instances_dir = Path(str(base) + ".instances")
+    instances_dir.mkdir(parents=True, exist_ok=True)
+    _cleanup_dead_instances(instances_dir)
+    profile = instances_dir / str(os.getpid())
+    profile.mkdir(parents=True, exist_ok=True)
+    return profile
+
+
+def _claim_profile() -> Path:
+    """
+    认领要使用的 profile 目录（须在持有 _lock 时调用）。
+
+    策略：
+    1. 已认领过 → 复用（同进程重建 context 不重复加锁）。
+    2. 对共享 base profile 加非阻塞 flock：
+       - 成功且无旧代码实例的 Chrome 占用 → 使用 base（保留既有登录态）。
+       - 失败（被其他实例持有）或发现无锁 Chrome 占用（旧版本实例）→ 使用独立实例目录。
+    3. 无 fcntl（Windows）→ 始终使用独立实例目录。
+    """
+    global _profile_lock_fd, _active_profile
+
+    if _active_profile is not None:
+        return _active_profile
+
+    base = Path(PROFILE_DIR)
+    base.mkdir(parents=True, exist_ok=True)
+
+    if fcntl is None:
+        _active_profile = _instance_profile(base)
+        return _active_profile
+
+    lock_path = Path(str(base) + ".lock")
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        # 被另一实例持有 → 用独立 profile
+        os.close(fd)
+        _active_profile = _instance_profile(base)
+        return _active_profile
+
+    # 持有锁。若发现未持锁的 Chrome 正占用 base（旧版本实例），
+    # 说明对方不遵守 flock，让路到独立 profile。
+    if _chrome_using_profile(base):
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        os.close(fd)
+        _active_profile = _instance_profile(base)
+        return _active_profile
+
+    _profile_lock_fd = fd
+    _active_profile = base
+    return base
+
+
+def _release_profile_lock() -> None:
+    """释放跨进程 profile 锁（在 close_context 中调用）。"""
+    global _profile_lock_fd, _active_profile
+    if _profile_lock_fd is not None and fcntl is not None:
+        try:
+            fcntl.flock(_profile_lock_fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        try:
+            os.close(_profile_lock_fd)
+        except OSError:
+            pass
+    _profile_lock_fd = None
+    _active_profile = None
+
+
+# ─── 浏览器启动（含孤儿回收重试） ────────────────────────────
+
+async def _launch_persistent(profile: Path) -> BrowserContext:
+    """
+    在指定 profile 上启动持久化上下文。
+
+    - 优先系统 Chrome（channel="chrome"），失败回退 Playwright 内置 Chromium。
+    - 首轮失败后清理孤儿 Chrome 与陈旧 Singleton 锁，再重试一轮
+      （修复"上一个实例被强杀后 Chrome 残留 / 锁残留"导致的启动即崩溃）。
+    """
+    downloads_path = os.getenv("PDF_DIR", str(_ROOT / "downloads"))
+    launch_args = ["--disable-blink-features=AutomationControlled", "--no-first-run"]
+
+    async def _try(use_channel: bool) -> BrowserContext:
+        assert _playwright is not None
+        if use_channel:
+            return await _playwright.chromium.launch_persistent_context(
+                str(profile),
+                channel="chrome",
+                headless=False,
+                accept_downloads=True,
+                args=launch_args,
+                locale="zh-CN",
+                downloads_path=downloads_path,
+            )
+        return await _playwright.chromium.launch_persistent_context(
+            str(profile),
+            headless=False,
+            accept_downloads=True,
+            args=launch_args,
+            locale="zh-CN",
+            downloads_path=downloads_path,
+        )
+
+    last_error: Optional[Exception] = None
+    chrome_error: Optional[Exception] = None
+
+    for attempt in range(2):
+        for use_channel in (True, False):  # 系统 Chrome → 内置 Chromium 兜底
+            try:
+                return await _try(use_channel)
+            except Exception as e:
+                last_error = e
+                if use_channel:
+                    chrome_error = e
+
+        if attempt == 0:
+            # 首轮失败：疑似孤儿 Chrome / 陈旧锁 → 清理后重试
+            killed = await _kill_orphan_chrome(profile)
+            if killed:
+                _remove_singleton_files(profile)
+                await asyncio.sleep(1.0)
+
+    # 内置 Chromium 未安装时报错无意义，优先抛系统 Chrome 的真实错误
+    if chrome_error is not None and last_error is not None and (
+        "Executable doesn't exist" in str(last_error)
+    ):
+        raise chrome_error
+    raise last_error if last_error is not None else RuntimeError("浏览器启动失败")
+
+
+# ─── 公共入口 ────────────────────────────────────────────────
+
+async def _discard_dead_context() -> None:
+    """丢弃崩溃/断开的死 context。
+
+    不释放 profile 锁：同一进程随后重建时 _claim_profile() 会复用
+    _active_profile，继续使用原 profile（保留登录态）。
+    """
+    global _context
+    ctx, _context = _context, None
+    if ctx is not None:
+        try:
+            await asyncio.wait_for(ctx.close(), timeout=5)
+        except Exception:
+            pass
+
 
 async def get_context() -> BrowserContext:
     """获取（或创建）全局浏览器上下文，启动一次后复用。"""
@@ -39,37 +330,21 @@ async def get_context() -> BrowserContext:
 
     async with _lock:
         if _context is not None:
+            # 真实 IPC 探活：.pages 是本地属性（不发协议消息），
+            # Chrome 中途崩溃时死 context 仍"可访问"，必须用会往返浏览器的调用。
             try:
-                # .pages 是属性（非协程），可正常访问即视为上下文有效
-                _ = _context.pages
+                await asyncio.wait_for(_context.cookies(), timeout=5)
                 return _context
             except Exception:
-                _context = None
+                # 崩溃/断开 → 丢弃死 context，走下方重建
+                await _discard_dead_context()
 
         if _playwright is None:
             _playwright = await async_playwright().start()
 
-        Path(PROFILE_DIR).mkdir(parents=True, exist_ok=True)
+        profile = _claim_profile()
 
-        # 优先系统 Chrome；失败则用 Playwright 内置 Chromium
-        try:
-            _context = await _playwright.chromium.launch_persistent_context(
-                PROFILE_DIR,
-                channel="chrome",
-                headless=False,
-                accept_downloads=True,
-                args=["--disable-blink-features=AutomationControlled", "--no-first-run"],
-                locale="zh-CN",
-                downloads_path=os.getenv("PDF_DIR", str(_ROOT / "downloads")),
-            )
-        except Exception:
-            _context = await _playwright.chromium.launch_persistent_context(
-                PROFILE_DIR,
-                headless=False,
-                accept_downloads=True,
-                locale="zh-CN",
-                downloads_path=os.getenv("PDF_DIR", str(_ROOT / "downloads")),
-            )
+        _context = await _launch_persistent(profile)
 
         # 恢复 Cookie
         await load_cookies(_context)
@@ -81,29 +356,42 @@ async def get_context() -> BrowserContext:
 
 
 async def close_context():
-    """关闭浏览器（服务器退出时调用）。"""
+    """关闭浏览器并释放 profile 锁（服务器退出时调用）。"""
     global _playwright, _context
     if _context:
-        await save_cookies(_context)
-        await _context.close()
+        try:
+            await save_cookies(_context)
+        except Exception:
+            pass
+        try:
+            await _context.close()
+        except Exception:
+            pass
         _context = None
     if _playwright:
-        await _playwright.stop()
+        try:
+            await _playwright.stop()
+        except Exception:
+            pass
         _playwright = None
+    _release_profile_lock()
 
 
 # ─── Cookie 管理 ────────────────────────────────────────────
 
 async def save_cookies(context: BrowserContext) -> int:
-    """保存当前上下文中所有 CNKI 相关 Cookie 到文件。"""
+    """保存当前上下文中所有 CNKI 相关 Cookie 到文件（原子写入，防多实例写坏）。"""
     all_cookies = await context.cookies()
     cnki_cookies = [
         c for c in all_cookies
         if "cnki" in c.get("domain", "").lower()
     ]
-    Path(COOKIE_FILE).parent.mkdir(parents=True, exist_ok=True)
-    with open(COOKIE_FILE, "w", encoding="utf-8") as f:
+    target = Path(COOKIE_FILE)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = Path(str(target) + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(cnki_cookies, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, target)
     return len(cnki_cookies)
 
 
@@ -154,7 +442,7 @@ async def check_login_status() -> dict:
 
         login_entries = [t for t in _LOGGED_OUT_TEXTS if t in body_text]
         if login_entries:
-            return {"logged_in": False, "detail": f"顶部仍有'机构登录'入口，未登录"}
+            return {"logged_in": False, "detail": "顶部仍有'机构登录'入口，未登录"}
 
         # 已登录：尝试提取机构名（"机构登录"右侧/替换位置的文字）
         return {"logged_in": True, "detail": "未发现'机构登录'入口，已机构登录"}

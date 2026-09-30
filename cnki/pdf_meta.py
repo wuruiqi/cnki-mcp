@@ -15,12 +15,16 @@ import re
 from pathlib import Path
 from typing import Dict, List
 
-# PyMuPDF（安装包名 pymupdf，导入名 fitz）
+# PyMuPDF（优先 import pymupdf，兼容 fitz）
 try:
-    import fitz  # type: ignore
+    import pymupdf as fitz
     _FITZ_OK = True
 except ImportError:
-    _FITZ_OK = False
+    try:
+        import fitz  # type: ignore
+        _FITZ_OK = True
+    except ImportError:
+        _FITZ_OK = False
 
 
 # DOI 正则：支持 "doi: 10.xxxx/...", "DOI:", "https://doi.org/..." 等写法

@@ -18,6 +18,7 @@ import random
 from pathlib import Path
 from typing import Optional, Dict, Tuple
 
+from playwright.async_api import ElementHandle
 from .browser import get_context
 
 PDF_DIR = os.getenv("PDF_DIR", str(Path(__file__).resolve().parent.parent / "downloads"))
@@ -129,7 +130,7 @@ async def _wait_for_captcha(page, wait_seconds: int = 120) -> bool:
 
 # ─── 下载按钮查找 ────────────────────────────────────────────
 
-async def _find_download_btn(page) -> Tuple[Optional[object], str]:
+async def _find_download_btn(page) -> Tuple[Optional[ElementHandle], str]:
     """
     在页面上查找下载按钮，返回 (element, format_str)。
     format_str 为 'pdf' 或 'caj'。
@@ -265,7 +266,10 @@ async def download_paper(
             "message": f"下载失败: {e}",
         }
     finally:
-        await page.close()
+        try:
+            await page.close()
+        except Exception:
+            pass  # Chrome 中途崩溃时 page 已失效，勿遮蔽真实错误
 
 
 async def batch_download(

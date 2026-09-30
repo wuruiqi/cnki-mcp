@@ -171,7 +171,7 @@ async def _extract_rows(page, max_count: int) -> List[Dict]:
                 pass
         return ""
 
-    papers = []
+    papers: list[dict] = []
 
     for row_sel in _ROW_SELECTORS:
         rows = await page.query_selector_all(row_sel)
@@ -310,7 +310,10 @@ async def search_papers(
             "message": f"找到 {len(papers)} 篇（原始 {len(raw)} 篇，年份 {year_start}-{year_end}），URL: {page.url[:80]}",
         }
     finally:
-        await page.close()
+        try:
+            await page.close()
+        except Exception:
+            pass  # Chrome 中途崩溃时 page 已失效，勿遮蔽真实错误
 
 
 async def search_multi_sort(
@@ -420,4 +423,7 @@ async def search_multi_sort(
             ),
         }
     finally:
-        await page.close()
+        try:
+            await page.close()
+        except Exception:
+            pass  # Chrome 中途崩溃时 page 已失效，勿遮蔽真实错误
