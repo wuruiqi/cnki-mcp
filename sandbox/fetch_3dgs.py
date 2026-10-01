@@ -2,7 +2,7 @@
 fetch_3dgs.py — 3D 高斯泼溅文献批量检索与导入 Zotero
 
 使用方法：
-  cd D:\automan\coding\projects\cnki-mcp
+  cd D:\automan\2-coding\projects\cnki-mcp
   python sandbox/fetch_3dgs.py
 
 流程：

@@ -26,5 +26,22 @@ venv/
 Thumbs.db
 
 # ─── 本地 AI 开发资产（内部，不提交）─────────────
+AGENTS.md
 CLAUDE.md
 _local/
+
+# ─── 密钥与 AI 工具本地配置（绝不提交）───────────────
+.mcp.json
+mcp_config.json
+.env
+.env.*
+*.env
+!.env.example
+
+# ─── 浏览器临时中转下载目录（真实落盘由 httpx 完成）──
+.downloads_tmp/
+
+# ─── 一次性诊断脚本（本地排查用，不入库）─────────────
+sandbox/diag_download*.py
+sandbox/test_dl*.py
+sandbox/test_login.py

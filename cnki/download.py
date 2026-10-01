@@ -66,6 +66,59 @@ def _safe_filename(title: str, suffix: str = ".pdf") -> str:
     return name + suffix
 
 
+_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+       "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
+
+
+async def _snapshot_cookie_header(ctx) -> str:
+    """把浏览器上下文的 Cookie 快照成可独立复用的 Cookie 头。
+
+    必须在点击下载【之前】调用 —— CNKI 会在下载启动后关闭页面，
+    届时整个浏览器上下文可能已销毁，再读 cookie 就来不及了。
+    非 ASCII 值（如 last_org 里的中文）直接跳过，避免 HTTP 客户端编码报错。
+    """
+    try:
+        cookies = await ctx.cookies()
+    except Exception:
+        return ""
+    parts = []
+    for c in cookies:
+        v = c.get("value", "")
+        try:
+            v.encode("ascii")
+        except UnicodeEncodeError:
+            continue
+        parts.append(f'{c.get("name")}={v}')
+    return "; ".join(parts)
+
+
+async def _http_fetch(url: str, cookie_header: str, referer: str):
+    """用独立 HTTP 客户端下载文件，返回 (bytes|None, err|None)。"""
+    headers = {
+        "User-Agent": _UA,
+        "Referer": referer,
+        "Accept": "application/pdf,*/*",
+        "Accept-Language": "zh-CN,zh;q=0.9",
+    }
+    if cookie_header:
+        headers["Cookie"] = cookie_header
+    try:
+        import httpx  # 延迟导入，避免成为硬依赖
+    except ImportError:
+        return None, "未安装 httpx（pip install httpx 后重试）"
+    try:
+        async with httpx.AsyncClient(trust_env=False, follow_redirects=True,
+                                     timeout=120, verify=False, headers=headers) as cli:
+            resp = await cli.get(url)
+            if resp.status_code == 200 and resp.content[:4] == b"%PDF":
+                return resp.content, None
+            snippet = resp.text[:160].replace("\n", " ") if resp.content else ""
+            return None, (f"HTTP {resp.status_code}, magic={resp.content[:8]!r}, "
+                          f"final={str(resp.url)[:90]}, body={snippet!r}")
+    except Exception as e:  # noqa: BLE001
+        return None, f"{type(e).__name__}: {e}"
+
+
 # ─── 验证码检测与处理 ────────────────────────────────────────
 
 async def _detect_captcha(page) -> bool:
@@ -181,33 +234,111 @@ async def _do_download(page, detail_url: str, title: Optional[str], timeout_ms: 
     safe_name = _safe_filename(title or f"paper_{hash(detail_url) % 100_000}", f".{fmt}")
     save_path = Path(PDF_DIR) / safe_name
 
+    # ⚠️ CNKI 下载的真实链路（2026-10-01 实测）：
+    #   点击 a#pdfDown（<a target="_blank" href="bar.cnki.net/bar/download/order?id=...">）
+    #   → 新标签页落地页 → 真实文件 https://docdown.cnki.net/docdown/fulltext/download?q=...
+    #   → 会话结束前 CNKI 脚本会 window.close() 掉页面；
+    #     Playwright 的持久化上下文一旦最后一个页面关闭就【整个浏览器进程退出】，
+    #     下载被腰斩，磁盘只剩 .crdownload 半成品。
+    # ⇒ 浏览器**只负责点出签名 URL**，文件字节交给独立 HTTP 客户端取（不受浏览器退出影响）。
+    ctx = page.context
+    cookie_header = await _snapshot_cookie_header(ctx)
+
+    captured: Dict = {"url": None, "dl": None}
+
+    # ★ 关键：把浏览器对 docdown.cnki.net 的请求【拦下并中止】。
+    # 该签名 URL 是【一次性】的 —— 若让浏览器真的发出去，令牌就被消耗，
+    # 我们再拿同一个 URL 去 httpx 取，只会得到一张 HTML 错误页。
+    async def _route_handler(route):
+        req = route.request
+        if "docdown.cnki.net" in req.url:
+            if not captured["url"]:
+                captured["url"] = req.url
+            try:
+                await route.abort()
+            except Exception:
+                pass
+        else:
+            try:
+                await route.continue_()
+            except Exception:
+                pass
+
+    def _on_download(dl):
+        captured["dl"] = dl
+        if not captured["url"]:
+            captured["url"] = dl.url
+
+    _route_pat = re.compile(r"docdown\.cnki\.net")
+    _routed = False
     try:
-        async with page.expect_download(timeout=timeout_ms) as dl_info:
-            await btn.click()
-        download = await dl_info.value
-        await download.save_as(str(save_path))
+        await ctx.route(_route_pat, _route_handler)
+        _routed = True
+    except Exception:
+        pass
+    ctx.on("download", _on_download)
+    try:
+        await btn.click()
+    except Exception:  # noqa: BLE001
+        # 点击后页面可能被站点立刻关闭，属预期行为
+        pass
 
-        if not save_path.exists():
-            alt = Path(PDF_DIR) / (download.suggested_filename or safe_name)
-            await download.save_as(str(alt))
-            save_path = alt
+    waited = 0
+    while not captured["url"] and waited < min(timeout_ms, 30_000):
+        await asyncio.sleep(0.2)
+        waited += 200
 
-        return {
-            "success": True, "captcha": False,
-            "file_path": str(save_path),
-            "file_name": save_path.name,
-            "format": fmt,
-            "message": f"已保存至 {save_path}",
-        }
+    try:
+        page.remove_listener("download", _on_download)
+        ctx.remove_listener("download", _on_download)
+    except Exception:
+        pass
+    if _routed:
+        try:
+            await ctx.unroute(_route_pat, _route_handler)
+        except Exception:
+            pass
 
-    except Exception as e:
-        # 点击后检测验证码
+    err = ""
+    # ── 主路径：独立 HTTP 取文件 ──
+    if captured["url"]:
+        data, err = await _http_fetch(captured["url"], cookie_header, detail_url)
+        if data:
+            save_path.write_bytes(data)
+            return {
+                "success": True, "captcha": False,
+                "file_path": str(save_path), "file_name": save_path.name,
+                "format": fmt,
+                "message": f"已保存至 {save_path}（{len(data)} bytes）",
+            }
+    else:
+        err = f"未捕获到下载 URL（{timeout_ms}ms 内）"
+
+    # ── 兜底：download 对象若还活着，试一次 save_as ──
+    dl = captured.get("dl")
+    if dl is not None:
+        try:
+            await dl.save_as(str(save_path))
+            if save_path.exists() and save_path.stat().st_size > 0:
+                return {
+                    "success": True, "captcha": False,
+                    "file_path": str(save_path), "file_name": save_path.name,
+                    "format": fmt,
+                    "message": f"已保存至 {save_path}（download 事件兜底）",
+                }
+        except Exception as e:  # noqa: BLE001
+            err = f"{err} / download 兜底亦失败: {e}"
+
+    is_captcha = False
+    try:
         is_captcha = await _detect_captcha(page)
-        return {
-            "success": False, "captcha": is_captcha,
-            "file_path": "", "file_name": "", "format": fmt,
-            "message": f"下载失败{'（验证码）' if is_captcha else ''}: {e}",
-        }
+    except Exception:
+        pass
+    return {
+        "success": False, "captcha": is_captcha,
+        "file_path": "", "file_name": "", "format": fmt,
+        "message": f"下载失败{'（验证码）' if is_captcha else ''}: {err}",
+    }
 
 
 # ─── 公共接口 ────────────────────────────────────────────────
@@ -265,7 +396,12 @@ async def download_paper(
             "message": f"下载失败: {e}",
         }
     finally:
-        await page.close()
+        # CNKI 下载后常会关掉页面、甚至整个浏览器；此时 close() 会抛 TargetClosedError，
+        # 属正常现象，吞掉即可（不该影响已拿到的结果）。
+        try:
+            await page.close()
+        except Exception:  # noqa: BLE001
+            pass
 
 
 async def batch_download(

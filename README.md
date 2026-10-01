@@ -131,6 +131,9 @@ cp .env.example .env                     # 按需修改配置
 - CNKI 每页约显示 20 条，`top_n > 20` 时实际返回数量受限（分页支持规划中）。
 - 若系统配置了 HTTP 代理，访问 Zotero 本地端口已通过 `httpx(trust_env=False)` 处理。
 - **CNKI 验证码（CAPTCHA）**：批量下载时如触发人机验证，下载将自动暂停并在控制台打印提示，请在保持打开的浏览器窗口中手动完成滑块验证后继续（等待上限 `captcha_wait` 秒，默认 120 秒）。浏览器须保持可见（`headless=False`，默认已满足）。
+- **IP 级人机验证风控**：短时间内大量请求后，`kns.cnki.net` 可能把**全部**请求 302 到 `/verify/home`（滑块/点选验证），此时检索与下载都会失败——这与"是否登录"无关，连不带 JS 的 `curl` 也会被拦。处理方式：在浏览器里人工过一次验证（`cnki_login_status` 会返回 `captcha: true` 作为提示），或更换网络出口。
+- **校外访问（CARSI / FSSO）登录同样被识别**：`cnki_login_status` 采用多信号判定（会话 Cookie `_shibsession_*` / `Ecp_session` / `SID_fsso` / `TDC_itoken`，并结合页面文字），并回传 `org`（机构名）。注意此类登录后 `www.cnki.net` 顶部**仍可能保留「机构登录」入口**，属正常现象。
+- **下载实现说明**：CNKI 的下载按钮会弹出新标签页，且下载启动后页面会被站点关闭。因此本工具**只用浏览器解析出签名下载地址，文件字节由 `httpx` 独立获取**，避免浏览器退出导致下载中断。签名地址为一次性，请勿复用。
 - 仅供个人学习研究用途，请遵守 CNKI 服务条款与所在机构的使用规定。
 
 ## 🛠 开发
@@ -140,7 +143,7 @@ pytest tests/test_unit.py -v    # 离线单元测试（19 个用例）
 ```
 
 诊断脚本见 [`tests/`](tests/)（`inspect_*` 检查 DOM 选择器，`probe_*` 测试 Zotero 端点）。
-实测要点与 2026 改版适配记录见 [CLAUDE.md](CLAUDE.md)。
+实测要点、版本变更与 2026 改版适配记录见 [docs/status.md](docs/status.md)。
 
 ## License
 

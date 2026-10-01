@@ -29,6 +29,10 @@ _RESULT_MARKERS = [
     ".brief-list",
 ]
 
+# 结果页"零结果"的文字标志（命中=到达结果页但无文献，≠ 加载失败）。
+# CNKI 检索无命中时正文极短并出现"抱歉"等字样，无 .result-table-list 容器。
+_NO_RESULT_TEXTS = ["抱歉", "没有找到", "未检索到", "检索结果为空", "未找到", "共找到 0"]
+
 # 结果行选择器（按优先级）
 _ROW_SELECTORS = [
     ".result-table-list tbody tr",
@@ -69,8 +73,14 @@ _SORT_SELECTORS: Dict[str, List[str]] = {
 }
 
 
-async def _fill_and_search(page, query: str) -> bool:
-    """在检索框输入关键词并提交，返回是否到达结果页。"""
+async def _fill_and_search(page, query: str) -> str:
+    """在检索框输入关键词并提交。
+
+    返回三态字符串：
+      "ok"        到达结果页且有结果容器
+      "no_result" 到达结果页但零命中（出现"抱歉/没有找到"等，无结果容器）
+      "fail"      未能填表/提交/到达结果页（疑似登录失效或 DOM 变更）
+    """
     # 填检索框
     filled = False
     for sel in _INPUT_SELECTORS:
@@ -82,7 +92,7 @@ async def _fill_and_search(page, query: str) -> bool:
         except Exception:
             pass
     if not filled:
-        return False
+        return "fail"
 
     # 点检索按钮（失败则回车兜底）
     clicked = False
@@ -98,17 +108,30 @@ async def _fill_and_search(page, query: str) -> bool:
         try:
             await page.press(_INPUT_SELECTORS[0], "Enter")
         except Exception:
-            return False
+            return "fail"
 
     # 等结果容器出现
     await page.wait_for_timeout(4500)
     for marker in _RESULT_MARKERS:
         try:
             if await page.locator(marker).count() > 0:
-                return True
+                return "ok"
         except Exception:
             pass
-    return False
+
+    # 无结果容器：再判定是"零命中"还是"加载失败"
+    # 已离开首页（URL 含 /search）且正文出现零结果字样 → 零命中
+    try:
+        body = await page.evaluate("document.body.innerText")
+    except Exception:
+        body = ""
+    on_result_page = "/search" in (page.url or "")
+    if on_result_page and any(t in body for t in _NO_RESULT_TEXTS):
+        return "no_result"
+    # 极短正文 + 已在结果页，也按零命中处理（CNKI 无命中页正文极短）
+    if on_result_page and len(body.strip()) < 800:
+        return "no_result"
+    return "fail"
 
 
 async def _restrict_to_db(page, db: str) -> None:
@@ -125,21 +148,24 @@ async def _restrict_to_db(page, db: str) -> None:
         pass
 
 
-async def _try_navigate_search(page, query: str, year_start: int, year_end: int, db: str) -> bool:
-    """打开检索首页并提交检索，返回是否成功到达结果页。"""
+async def _try_navigate_search(page, query: str, year_start: int, year_end: int, db: str) -> str:
+    """打开检索首页并提交检索。
+
+    返回 _fill_and_search 的三态："ok" / "no_result" / "fail"。
+    """
     try:
         await page.goto(_SEARCH_HOME, wait_until="domcontentloaded", timeout=25_000)
         await page.wait_for_timeout(3500)
     except Exception:
-        return False
+        return "fail"
 
-    reached = await _fill_and_search(page, query)
-    if not reached:
-        return False
+    status = await _fill_and_search(page, query)
+    if status != "ok":
+        return status
 
     # 限定文献类型（期刊/学位论文）
     await _restrict_to_db(page, db)
-    return True
+    return "ok"
 
 
 async def _click_sort(page, sort_by: str) -> bool:
@@ -282,9 +308,19 @@ async def search_papers(
     ctx = await get_context()
     page = await ctx.new_page()
     try:
-        reached = await _try_navigate_search(page, query, year_start, year_end, db_code)
+        status = await _try_navigate_search(page, query, year_start, year_end, db_code)
 
-        if not reached:
+        if status == "no_result":
+            # 检索成功执行，但 CNKI 零命中（查新中这是高新颖性信号）
+            return {
+                "success": True,
+                "query": query,
+                "count": 0,
+                "papers": [],
+                "message": f"检索成功，CNKI 无匹配文献（零命中），年份 {year_start}-{year_end}。",
+            }
+
+        if status != "ok":
             return {
                 "success": False,
                 "query": query,
@@ -310,7 +346,10 @@ async def search_papers(
             "message": f"找到 {len(papers)} 篇（原始 {len(raw)} 篇，年份 {year_start}-{year_end}），URL: {page.url[:80]}",
         }
     finally:
-        await page.close()
+        try:
+            await page.close()
+        except Exception:  # noqa: BLE001
+            pass
 
 
 async def search_multi_sort(
@@ -346,8 +385,18 @@ async def search_multi_sort(
     ctx = await get_context()
     page = await ctx.new_page()
     try:
-        reached = await _try_navigate_search(page, query, year_start, year_end, db_code)
-        if not reached:
+        status = await _try_navigate_search(page, query, year_start, year_end, db_code)
+        if status == "no_result":
+            return {
+                "success": True,
+                "papers": [],
+                "by_time_count": 0,
+                "by_citations_count": 0,
+                "total_after_dedup": 0,
+                "sort_used": {"time": False, "citations": False},
+                "message": "检索成功，CNKI 无匹配文献（零命中）。",
+            }
+        if status != "ok":
             return {
                 "success": False,
                 "papers": [],
